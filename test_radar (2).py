@@ -24,6 +24,12 @@ If a vehicle passes and you see nothing, check:
   • DIP switch 1 direction: OFF = advance only, ON = bi-directional.
   • Run with --raw to see every byte the radar sends.
 
+KEY FIX vs earlier version
+────────────────────────────
+The AGD307 terminates speed lines with \\r (carriage return) ONLY — no \\n.
+The buffer normalises all CR / CRLF / LF variants to \\n before splitting,
+so speed values are never silently swallowed in the read buffer.
+
 Usage
 ─────
   python3 test_radar.py                          # /dev/ttyUSB0 @ 9600
@@ -31,6 +37,7 @@ Usage
   python3 test_radar.py --baud 115200            # if *BAUD=3 was previously set
   python3 test_radar.py --limit 60               # different speed highlight
   python3 test_radar.py --raw                    # also print raw bytes
+  python3 test_radar.py --no-init                # skip handshake (already configured)
 
 Press Ctrl+C to exit and see a session summary.
 =============================================================================
@@ -49,11 +56,11 @@ ap = argparse.ArgumentParser(
     description="AGD 307 radar live terminal test",
     formatter_class=argparse.RawDescriptionHelpFormatter,
 )
-ap.add_argument("--port",  default="/dev/ttyUSB0", help="Serial port (default: /dev/ttyUSB0)")
-ap.add_argument("--baud",  default=9600, type=int,  help="Baud rate (default: 9600 — AGD 307 factory default)")
-ap.add_argument("--limit", default=40,  type=float, help="Speed limit km/h for highlight (default: 40)")
-ap.add_argument("--raw",   action="store_true",     help="Print raw radar lines alongside parsed values")
-ap.add_argument("--no-init", action="store_true",   help="Skip AGD handshake and *MS=5 (use if already configured)")
+ap.add_argument("--port",    default="/dev/ttyUSB0", help="Serial port (default: /dev/ttyUSB0)")
+ap.add_argument("--baud",    default=9600, type=int,  help="Baud rate (default: 9600 — AGD 307 factory default)")
+ap.add_argument("--limit",   default=40,  type=float, help="Speed limit km/h for highlight (default: 40)")
+ap.add_argument("--raw",     action="store_true",     help="Print raw radar lines alongside parsed values")
+ap.add_argument("--no-init", action="store_true",     help="Skip AGD handshake and *MS=5 (use if already configured)")
 args = ap.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -76,16 +83,20 @@ BOLD   = "\033[1m"
 RESET  = "\033[0m"
 
 # ---------------------------------------------------------------------------
-# ── PARSER — mirrors RadarReader._parse_speed() in main.py exactly
-# ── *MS=5 format: bare 2-digit integer  "42"
-# ── *MS=6 format: *Sddd                 "*S042"
-# ── Legacy:       SPD:dd.d              "SPD:42.3"
+# ── SPEED LINE PARSER
+# ── *MS=5 format : bare 2-digit integer  "42"
+# ── *MS=6 format : *Sddd                 "*S042"
+# ── Legacy       : SPD:dd.d              "SPD:42.3"
 # ---------------------------------------------------------------------------
 _MS5_RE = re.compile(r"^(\d{2,3})$")
 _MS6_RE = re.compile(r"^\*S(\d{3})$")
 _SPD_RE = re.compile(r"^SPD:(\d{1,3}(?:\.\d{1,2})?)$")
 
 def parse_speed(line: str) -> float | None:
+    """Return speed in km/h or None if the line is not a speed reading."""
+    # Skip command echoes and error lines
+    if "ERROR" in line.upper():
+        return None
     if line.startswith("#") or (line.startswith("*") and not line.startswith("*S")):
         return None
     for pattern in (_MS5_RE, _MS6_RE, _SPD_RE):
@@ -93,7 +104,7 @@ def parse_speed(line: str) -> float | None:
         if m:
             try:
                 val = float(m.group(1))
-                if 0.0 <= val <= 300.0:
+                if 0.0 <= val <= 300.0:   # sanity-check: AGD307 max range ~250 km/h
                     return val
             except ValueError:
                 pass
@@ -152,7 +163,7 @@ def send_cmd(cmd: str, label: str, wait: float = 0.4) -> str:
     ser.write((cmd + "\r").encode("ascii"))
     ser.flush()
     time.sleep(wait)
-    raw = ser.read(ser.in_waiting).decode("ascii", errors="ignore")
+    raw  = ser.read(ser.in_waiting).decode("ascii", errors="ignore")
     resp = raw.strip().replace("\r\n", " | ").replace("\r", " ").replace("\n", " ")
     print(f"  >> {cmd:<20}  <<  {resp if resp else '(no response)'}")
     return resp
@@ -184,7 +195,8 @@ if not args.no_init:
     print()
 
     print("── Step 3/3  Enable speed streaming  (*MS=5 → dd @ 10 fps) ───────")
-    send_cmd("*MS=5", "enable speed streaming")
+    send_cmd("*MS=5",       "enable speed streaming")
+    send_cmd("*LOWSPEED=1", "set low speed threshold to 1 kph")
     print(f"  {GREEN}Speed streaming enabled.{RESET}")
     print()
     print("  NOTE: The radar only sends speed values when it detects a vehicle")
@@ -195,8 +207,13 @@ else:
 
 # ---------------------------------------------------------------------------
 # ── LIVE READ LOOP
+# ──
+# ── CRITICAL FIX: The AGD307 terminates speed lines with \r (CR) only —
+# ── no \n (LF). The old version split only on \n so all speed data was
+# ── silently swallowed in the buffer and never parsed.
+# ── Fix: normalise \r\n → \n then \r → \n before splitting.
 # ---------------------------------------------------------------------------
-ser.timeout = 1.0   # fast timeout for responsive reads
+ser.timeout = 1.0   # short timeout for responsive reads
 
 print("=" * 62)
 print("  Live speed readings  (Ctrl+C to stop)")
@@ -209,6 +226,7 @@ violations     = 0
 session_max    = 0.0
 start_time     = time.monotonic()
 last_data_time = time.monotonic()
+last_warn_time = 0.0          # throttle the "no data" warning to once per 3 s
 buffer         = ""
 
 try:
@@ -221,15 +239,23 @@ try:
             break
 
         if not chunk:
-            # Nothing received in the last 1 s — check if we should warn
-            elapsed_silent = time.monotonic() - last_data_time
-            if valid_readings == 0 and (time.monotonic() - start_time) > 8:
-                print(f"  {YELLOW}[No speed data yet — drive a vehicle past the radar]{RESET}")
-                last_data_time = time.monotonic()  # throttle this message
+            # Nothing received — print a gentle reminder (throttled to 3 s)
+            now = time.monotonic()
+            if valid_readings == 0 and (now - start_time) > 8:
+                if now - last_warn_time > 3.0:
+                    print(f"  {YELLOW}[No speed data yet — drive a vehicle past the radar]{RESET}")
+                    last_warn_time = now
             continue
 
         last_data_time = time.monotonic()
         buffer += chunk
+
+        # ── KEY FIX ──────────────────────────────────────────────────────
+        # AGD307 uses bare \r as line terminator.
+        # Normalise \r\n first (so it becomes one \n, not two),
+        # then convert any remaining bare \r to \n.
+        buffer = buffer.replace("\r\n", "\n").replace("\r", "\n")
+        # ─────────────────────────────────────────────────────────────────
 
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
@@ -239,8 +265,8 @@ try:
             if not line:
                 continue
 
-            speed = parse_speed(line)
-            now   = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            speed   = parse_speed(line)
+            now_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
             if speed is not None:
                 valid_readings += 1
@@ -257,13 +283,12 @@ try:
                     tag       = ""
 
                 raw_part = f"  {CYAN}[{line}]{RESET}" if args.raw else ""
-                print(f"  {now}  {speed_str}  {bar}{tag}{raw_part}")
+                print(f"  {now_str}  {speed_str}  {bar}{tag}{raw_part}")
 
             else:
-                # Line received but not a speed — command echo / status message
+                # Line received but not a speed value — command echo or status
                 if args.raw:
-                    now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                    print(f"  {now}  {YELLOW}[ctrl]{RESET}  {CYAN}{line}{RESET}")
+                    print(f"  {now_str}  {YELLOW}[ctrl]{RESET}  {CYAN}{line}{RESET}")
 
 except KeyboardInterrupt:
     pass
@@ -290,6 +315,10 @@ if total_lines > 0 and valid_readings == 0:
     print("  The radar is sending data but in an unexpected format.")
     print("  Run with --raw to see exactly what the radar is sending.")
     print("  Then compare it to the *MS command table (manual p.20).")
+elif total_lines == 0 and valid_readings == 0:
+    print()
+    print(f"  {YELLOW}WARNING: no data received at all during the session.{RESET}")
+    print("  The radar may not be sending — check wiring and rotary switch.")
 
 print("=" * 62)
 print()
